@@ -1,132 +1,127 @@
-﻿const http = require('http');
-const WebSocket = require('ws');
+﻿import express from "express";
+import { WebSocketServer } from "ws";
+import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
+import { createClient } from "redis";
+import { config } from "dotenv";
+import OpenAI from "openai";
 
-const clients = new Set();
-const roomMessages = new Map(); // { oda: [mesaj1, mesaj2, ...] }
+config();
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("WebSocket sunucusu çalışıyor.");
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const app = express();
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+const messages = new Map();
+const roomMessages = new Map();
+
+const redis = createClient({
+  url: process.env.REDIS_URL || "redis://localhost:6379",
 });
 
-const wss = new WebSocket.Server({ server });
+await redis.connect();
 
-function broadcastUserList(room) {
-  const userList = [];
+const loadMessages = async (room) => {
+  const list = await redis.lRange(room, 0, -1);
+  const parsed = list.map((str) => JSON.parse(str));
+  roomMessages.set(room, parsed);
+};
 
-  clients.forEach(ws => {
-    if (ws.readyState !== WebSocket.OPEN) {
-      clients.delete(ws);
-      return;
-    }
+app.get("/", async (_, res) => {
+  const html = await readFile("./index.html", "utf-8");
+  res.setHeader("content-type", "text/html").send(html);
+});
 
-    if (ws.userData.room === room) {
-      userList.push(ws.userData.username);
-    }
-  });
-
-  const message = JSON.stringify({
-    type: 'userList',
-    users: userList,
-    room
-  });
-
-  clients.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN && ws.userData.room === room) {
-      ws.send(message);
+const broadcast = (room, data) => {
+  messages.forEach((wsRoom, ws) => {
+    if (wsRoom === room && ws.readyState === 1) {
+      ws.send(JSON.stringify(data));
     }
   });
-}
+};
 
-wss.on('connection', (ws) => {
-  ws.userData = { username: null, room: null };
-  clients.add(ws);
+const isWakingTesla = (text) => /^(@tesla|tesla:)/i.test(text);
+const isTeslaMessage = (text) => text.toLowerCase().startsWith("tesla ");
 
-  ws.on('message', (data) => {
+wss.on("connection", (ws) => {
+  ws.on("message", async (msgStr) => {
     let msg;
     try {
-      msg = JSON.parse(data);
+      msg = JSON.parse(msgStr);
     } catch {
       return;
     }
 
-    // Odaya katılma
-    if (msg.type === 'join') {
-      ws.userData.username = msg.username;
-      ws.userData.room = msg.room;
+    if (!msg.room || !msg.username || !msg.message) return;
 
-      // Eski mesajları gönder
+    messages.set(ws, msg.room);
+
+    if (!roomMessages.has(msg.room)) {
+      await loadMessages(msg.room);
+    }
+
+    const lowerMsg = msg.message.toLowerCase();
+
+    // ✅ Sunucunun kendi GPT çağrısı devre dışı bırakıldı
+    if (isWakingTesla(lowerMsg) || isTeslaMessage(lowerMsg)) {
+      console.log("⏹️ Server GPT cevabı iptal edildi. Client üzerinden çalışıyor.");
+      return;
+
+      /*
+      // 🧠 Önceki GPT-3.5 cevabı - yorumda kaldı
+      let prompt = msg.message.replace(/^(@tesla|tesla:|tesla)/i, "").trim();
+      if (!prompt || prompt.length < 3) return;
+
       const history = roomMessages.get(msg.room) || [];
-      history.forEach(m => {
-        ws.send(JSON.stringify(m));
+      const recent = history
+        .filter((m) => m.username === "tesla" || m.username === msg.username)
+        .slice(-6)
+        .map((m) => ({
+          role: m.username === "tesla" ? "assistant" : "user",
+          content: m.message,
+        }));
+
+      recent.unshift({
+        role: "system",
+        content: "You are Tesla, a helpful assistant who speaks Turkish.",
       });
 
-      broadcastUserList(msg.room);
-      return;
-    }
+      try {
+        const response = await openai.chat.completions.create({
+          model: "gpt-3.5-turbo",
+          messages: recent,
+        });
 
-    // Yeni mesaj gönderme
-    if (msg.type === 'message') {
-      const messageObj = {
-        username: msg.username,
-        room: msg.room,
-        message: msg.message
-      };
+        const teslaReply = {
+          username: "tesla",
+          room: msg.room,
+          message: response.choices[0].message.content.trim(),
+          timestamp: Date.now(),
+        };
 
-      if (!roomMessages.has(msg.room)) {
-        roomMessages.set(msg.room, []);
+        roomMessages.get(msg.room).push(teslaReply);
+        await redis.rPush(msg.room, JSON.stringify(teslaReply));
+        broadcast(msg.room, teslaReply);
+      } catch (err) {
+        console.error("OpenAI error:", err.message);
       }
-      roomMessages.get(msg.room).push(messageObj);
-
-      clients.forEach(client => {
-        if (
-          client.readyState === WebSocket.OPEN &&
-          client.userData.room === msg.room
-        ) {
-          client.send(JSON.stringify(messageObj));
-        }
-      });
-      return;
+      */
     }
 
-    // Sadece kendi mesajlarını silme
-    if (msg.type === 'deleteOwnMessages') {
-      const room = msg.room;
-      const username = msg.username;
-
-      if (roomMessages.has(room)) {
-        const filtered = roomMessages.get(room).filter(m => m.username !== username);
-        roomMessages.set(room, filtered);
-      }
-
-      // Tüm kullanıcılara önce temizleme bildirimi
-      clients.forEach(client => {
-        if (
-          client.readyState === WebSocket.OPEN &&
-          client.userData.room === room
-        ) {
-          client.send(JSON.stringify({ type: 'cleared', room }));
-
-          // Güncel mesajları yeniden gönder
-          roomMessages.get(room).forEach(m => {
-            client.send(JSON.stringify(m));
-          });
-        }
-      });
-
-      return;
-    }
+    msg.timestamp = Date.now();
+    const history = roomMessages.get(msg.room);
+    history.push(msg);
+    await redis.rPush(msg.room, JSON.stringify(msg));
+    broadcast(msg.room, msg);
   });
 
-  ws.on('close', () => {
-    clients.delete(ws);
-    if (ws.userData.room) {
-      broadcastUserList(ws.userData.room);
-    }
+  ws.on("close", () => {
+    messages.delete(ws);
   });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`WebSocket sunucusu ${PORT} portunda çalışıyor`);
+server.listen(process.env.PORT || 3000, () => {
+  console.log("✅ Server ready http://localhost:3000");
 });
